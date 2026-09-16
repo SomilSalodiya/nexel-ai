@@ -53,25 +53,83 @@ function fallbackTitle(content: string): string {
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
+// ============================================================
+// ROBUST JSON EXTRACTOR — handles Hindi, Hinglish, unicode, fences
+// ============================================================
+function extractJSON(text: string): unknown {
+  if (!text) return null;
+
+  let cleaned = text.trim();
+  // Remove markdown code fences
+  cleaned = cleaned
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/```\s*$/i, "");
+  cleaned = cleaned.trim();
+
+  // Direct parse
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // continue
+  }
+
+  // Find first { and last }
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    const jsonStr = cleaned.slice(firstBrace, lastBrace + 1);
+    try {
+      return JSON.parse(jsonStr);
+    } catch {
+      // continue
+    }
+
+    // Aggressive cleanup: replace unescaped newlines inside strings
+    try {
+      const fixed = jsonStr.replace(
+        /"((?:[^"\\]|\\.)*)"/g,
+        (match) =>
+          match
+            .replace(/\n/g, "\\n")
+            .replace(/\r/g, "\\r")
+            .replace(/\t/g, "\\t")
+      );
+      return JSON.parse(fixed);
+    } catch {
+      // continue
+    }
+
+    // Try replacing smart quotes
+    try {
+      const fixed = jsonStr
+        .replace(/[\u201C\u201D]/g, '\\"')
+        .replace(/[\u2018\u2019]/g, "'");
+      return JSON.parse(fixed);
+    } catch {
+      // continue
+    }
+  }
+
+  return null;
+}
+
 function getLanguageInstruction(lang: Language): string {
   if (lang === "hindi") {
-    return `IMPORTANT LANGUAGE RULE: Write ALL narration in HINDI (Devanagari script). 
-Example narration: "आज हम HTTP के बारे में सीखेंगे। यह एक प्रोटोकॉल है जिसका उपयोग वेब पर किया जाता है।"
-- Titles and bullets can be in Devanagari too
-- The "content" field (detailed explanation) should also be in Hindi
-- Keep technical terms like "HTTP", "HTML", "CSS" in English
-- Speak like a Hindi professor teaching in a classroom`;
+    return `LANGUAGE: Write ALL narration in HINDI (Devanagari script).
+Example: "आज हम HTTP के बारे में सीखेंगे। यह एक प्रोटोकॉल है जिसका उपयोग वेब पर किया जाता है।"
+- Titles and bullets also in Devanagari
+- The "content" field also in Hindi
+- Keep technical terms (HTTP, HTML, CSS) in English`;
   }
   if (lang === "hinglish") {
-    return `IMPORTANT LANGUAGE RULE: Write ALL narration in HINGLISH — a natural mix of Hindi and English as spoken by Indian students.
-Example narration: "Aaj hum HTTP ke baare mein seekhenge. Yeh ek protocol hai jiska use web par hota hai. Basically yeh client aur server ke beech communication का काम करता है."
-- Use Roman script for Hindi words (e.g. "samjhenge", "hai", "kaam")
-- You MAY use Devanagari for emphasis (like "काम")
-- Keep it natural — how you'd explain to a friend
-- Keep technical terms like "HTTP", "HTML", "CSS" in English
-- Do NOT be overly formal — use casual Hinglish`;
+    return `LANGUAGE: Write ALL narration in HINGLISH — natural mix of Hindi and English.
+Example: "Aaj hum HTTP ke baare mein seekhenge. Yeh ek protocol hai jiska use web par hota hai."
+- Use ROMAN script only (no Devanagari)
+- Do NOT use double quotes inside text — use single quotes or none
+- Keep technical terms (HTTP, HTML, CSS) in English`;
   }
-  return `LANGUAGE: Write all narration in clear, natural English.`;
+  return "LANGUAGE: Write all narration in clear English.";
 }
 
 async function callGroq(
@@ -89,24 +147,27 @@ async function callGroq(
       ],
       temperature: 0.5,
       max_tokens: maxTokens,
-      response_format: { type: "json_object" },
     });
-    return completion.choices[0]?.message?.content || "{}";
+    return completion.choices[0]?.message?.content || "";
   } catch (err) {
-    console.log("20b failed, trying 120b:", err instanceof Error ? err.message.slice(0, 60) : "");
+    console.log("20b failed:", err instanceof Error ? err.message.slice(0, 80) : "");
   }
   await new Promise((r) => setTimeout(r, 1200));
-  const completion = await groq.chat.completions.create({
-    model: "openai/gpt-oss-120b",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-    temperature: 0.5,
-    max_tokens: maxTokens,
-    response_format: { type: "json_object" },
-  });
-  return completion.choices[0]?.message?.content || "{}";
+  try {
+    const completion = await groq.chat.completions.create({
+      model: "openai/gpt-oss-120b",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      temperature: 0.5,
+      max_tokens: maxTokens,
+    });
+    return completion.choices[0]?.message?.content || "";
+  } catch (err) {
+    console.log("120b failed:", err instanceof Error ? err.message.slice(0, 80) : "");
+    throw err;
+  }
 }
 
 async function nameCluster(
@@ -128,17 +189,18 @@ async function nameCluster(
   if (language === "hindi") {
     langRule = "Output ONLY a 3-5 word title in HINDI (Devanagari script).";
   } else if (language === "hinglish") {
-    langRule = "Output ONLY a 3-5 word title in HINGLISH (Roman Hindi script, mixed with English technical terms). Example: 'HTTP Methods aur Status Codes'.";
+    langRule =
+      "Output ONLY a 3-5 word title in HINGLISH (Roman Hindi + English terms).";
   }
 
-  for (const model of ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]) {
+  for (const model of ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]) {
     try {
       const completion = await groq.chat.completions.create({
         model,
         messages: [
           {
             role: "system",
-            content: `You name textbook chapters. ${langRule} No quotes, no period.`,
+            content: `You name textbook chapters. ${langRule} No quotes, no period. Output ONLY the title text.`,
           },
           { role: "user", content },
         ],
@@ -167,98 +229,98 @@ async function generateTopicScenes(
 
   const systemPrompt = `You are an expert educational video scriptwriter. Given content from a PDF, create a 6-scene study lecture section.
 
-Respond ONLY with valid JSON in this exact format:
+${langInstruction}
+
+RETURN ONLY VALID JSON. No markdown. No code fences. No explanation before or after.
+
+Structure:
 {
   "scenes": [
-    { "type": "title", "title": "...", "subtitle": "Unit ${topicIdx + 1}", "narration": "..." },
-    { "type": "teach", "title": "...", "content": "150-250 word explanation", "narration": "60-90 word spoken version" },
-    { "type": "bullets", "title": "...", "bullets": ["Point 1", "Point 2", "Point 3"], "narration": "..." },
-    { "type": "pie", "title": "...", "data": [{"label": "...", "value": 40}, {"label": "...", "value": 35}, {"label": "...", "value": 25}], "narration": "..." },
-    { "type": "bullets", "title": "...", "bullets": ["Point A", "Point B"], "narration": "..." },
-    { "type": "recap", "title": "...", "bullets": ["Recap 1", "Recap 2"], "narration": "..." }
+    { "type": "title", "title": "Title", "subtitle": "Unit ${topicIdx + 1}", "narration": "Welcome narration" },
+    { "type": "teach", "title": "Concept", "content": "150-250 word explanation", "narration": "60-90 word spoken version" },
+    { "type": "bullets", "title": "Key Points", "bullets": ["P1", "P2", "P3"], "narration": "Summary" },
+    { "type": "pie", "title": "Distribution", "data": [{"label": "A", "value": 40}, {"label": "B", "value": 35}, {"label": "C", "value": 25}], "narration": "Chart narration" },
+    { "type": "bullets", "title": "More Points", "bullets": ["A", "B"], "narration": "More narration" },
+    { "type": "recap", "title": "Recap", "bullets": ["R1", "R2"], "narration": "Recap narration" }
   ]
 }
 
-${langInstruction}
+CRITICAL RULES:
+- EXACTLY 6 scenes: title, teach, bullets, pie, bullets, recap
+- Pie data: 3-4 categories summing to 100
+- Narrations: 60-90 words each
+- Never use unescaped double quotes inside string values — use single quotes or omit
+- Never include newlines inside string values
+- Start response with { and end with }`;
 
-SCENE REQUIREMENTS:
-- EXACTLY 6 scenes
-- Scene 1: title
-- Scene 2: teach (deep concept explanation)
-- Scene 3: bullets
-- Scene 4: pie (3-4 categories summing to 100)
-- Scene 5: bullets
-- Scene 6: recap
+  const userPrompt = `Topic: "${title}" (Unit ${topicIdx + 1} of ${totalTopics})
 
-PIE CHART RULES:
-- 3-4 categories with values summing to 100
-- Labels: short (< 15 chars)
-- May be in English even if narration is Hindi/Hinglish
+Content:
+${content}
 
-NARRATION RULES:
-- 60-90 words per scene (30-45 seconds spoken)
-- Natural, conversational
-- Use "we", "you", "let's" (or Hindi equivalents: "hum", "aap", "chaliye")
-
-Do not include any text outside the JSON.`;
-
-  const userPrompt = `Topic: "${title}" (Unit ${topicIdx + 1} of ${totalTopics})\n\nContent:\n${content}\n\nGenerate 6 scenes in ${language}.`;
+Return the JSON now in ${language}.`;
 
   const raw = await callGroq(groq, systemPrompt, userPrompt, 3500);
 
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
+  console.log(`    Raw response (first 150 chars): ${raw.slice(0, 150)}`);
+
+  const parsed = extractJSON(raw) as { scenes?: Scene[] } | null;
+
+  if (!parsed || !parsed.scenes || !Array.isArray(parsed.scenes)) {
+    console.log(`    ⚠️ JSON parse failed for "${title}", using fallback`);
     return [
       {
         type: "title",
         title,
         subtitle: `Unit ${topicIdx + 1}`,
-        narration: language === "english"
-          ? `Let's begin this section on ${title}.`
-          : language === "hindi"
-          ? `चलिए इस सेक्शन को शुरू करते हैं - ${title}।`
-          : `Chaliye is section ko start karte hain - ${title}.`,
+        narration:
+          language === "english"
+            ? `Let's begin this section on ${title}.`
+            : language === "hindi"
+            ? `चलिए इस सेक्शन को शुरू करते हैं - ${title}।`
+            : `Chaliye is section ko start karte hain - ${title}.`,
       },
       {
         type: "teach",
         title,
         content: content.slice(0, 500),
-        narration: language === "english"
-          ? `Here's an overview of ${title}.`
-          : language === "hindi"
-          ? `यहाँ ${title} का एक overview है।`
-          : `Yahan ${title} ka ek overview hai.`,
+        narration:
+          language === "english"
+            ? `Here's an overview of ${title}.`
+            : language === "hindi"
+            ? `यहाँ ${title} का एक overview है।`
+            : `Yahan ${title} ka ek overview hai.`,
       },
       {
         type: "recap",
         title: "Recap",
         bullets: ["Study the key concepts"],
-        narration: language === "english"
-          ? `That covers the basics of ${title}.`
-          : language === "hindi"
-          ? `यह ${title} की basics थीं।`
-          : `Yeh ${title} ki basics thi.`,
+        narration:
+          language === "english"
+            ? `That covers the basics of ${title}.`
+            : language === "hindi"
+            ? `यह ${title} की basics थीं।`
+            : `Yeh ${title} ki basics thi.`,
       },
     ];
   }
 
-  const scenes = (parsed.scenes || []).filter(
-    (s: Record<string, unknown>) =>
-      s && typeof s === "object" && s.type && s.narration
+  const scenes = parsed.scenes.filter(
+    (s) => s && typeof s === "object" && "type" in s && "narration" in s
   );
 
-  return scenes.length > 0
-    ? scenes
-    : [
-        {
-          type: "title",
-          title,
-          subtitle: `Unit ${topicIdx + 1}`,
-          narration: language === "english" ? `Let's explore ${title}.` : `${title} ko explore karte hain.`,
-        },
-      ];
+  if (scenes.length === 0) {
+    return [
+      {
+        type: "title",
+        title,
+        subtitle: `Unit ${topicIdx + 1}`,
+        narration: `Let's explore ${title}.`,
+      },
+    ];
+  }
+
+  return scenes;
 }
 
 export async function POST(req: NextRequest) {
@@ -393,12 +455,19 @@ export async function POST(req: NextRequest) {
 
     allScenes.push({
       type: "recap",
-      title: language === "english" ? "Full Lecture Recap" : language === "hindi" ? "पूरा Lecture Recap" : "Full Lecture Recap",
+      title:
+        language === "english"
+          ? "Full Lecture Recap"
+          : language === "hindi"
+          ? "पूरा Lecture Recap"
+          : "Full Lecture Recap",
       bullets: chapters.map((c) => c.title),
       narration: finalRecap,
     });
 
-    console.log(`✅ Generated ${allScenes.length} scenes across ${chapters.length} chapters in ${language}`);
+    console.log(
+      `✅ Generated ${allScenes.length} scenes across ${chapters.length} chapters in ${language}`
+    );
 
     return NextResponse.json({
       success: true,
