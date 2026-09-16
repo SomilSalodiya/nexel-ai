@@ -6,13 +6,13 @@ import Link from "next/link";
 import { FileText, Trash2, Loader2, MessageSquare } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 
+
 type Pdf = {
   name: string;
-  id: string;
+  id: string | null;
   created_at: string;
   metadata: { size?: number } | null;
 };
-
 export default function PdfList({
   pdfs,
   userId,
