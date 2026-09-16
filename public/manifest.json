@@ -1,0 +1,18 @@
+{
+  "name": "Nexel AI — Transform PDFs into Interactive Knowledge",
+  "short_name": "Nexel AI",
+  "description": "AI-powered study workspace. Chat with PDFs, generate notes, flashcards, and quizzes.",
+  "start_url": "/dashboard",
+  "display": "standalone",
+  "background_color": "#05060f",
+  "theme_color": "#a855f7",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
