@@ -11,7 +11,9 @@ type Pdf = {
   name: string;
   id: string | null;
   created_at: string | null;
-  metadata: { size?: number } | null;
+  updated_at?: string | null;
+  last_accessed_at?: string | null;
+  metadata: { size?: number; mimetype?: string; cacheControl?: string } | null;
 };
 export default function PdfList({
   pdfs,
