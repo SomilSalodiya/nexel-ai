@@ -303,13 +303,12 @@ export default function VideoPlayer({ pdfs }: { pdfs: Pdf[] }) {
     if (!scene) return;
     const isLast = currentScene >= script.scenes.length - 1;
 
-    const cleanup = speakText(scene.narration, () => {
+    speakText(scene.narration, () => {
       if (isLast) setIsPlaying(false);
       else setCurrentScene((s) => Math.min(s + 1, script.scenes.length - 1));
     });
 
     return () => {
-      cleanup?.();
       stopSpeaking();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

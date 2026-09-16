@@ -214,13 +214,12 @@ export default function LectureBuilder({ pdfs }: { pdfs: Pdf[] }) {
     if (!scene) return;
     const isLast = currentScene >= scenes.length - 1;
 
-    const cleanup = speakText(scene.narration, () => {
+    speakText(scene.narration, () => {
       if (isLast) setIsPlaying(false);
       else setCurrentScene((s) => s + 1);
     });
 
     return () => {
-      cleanup?.();
       stopSpeaking();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
