@@ -26,26 +26,45 @@ function chunkText(text: string): string[] {
 }
 
 async function getEmbedding(text: string): Promise<number[]> {
-  const res = await fetch(HF_API, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      inputs: text,
-      options: { wait_for_model: true },
-    }),
-  });
+  let lastError: unknown;
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`HuggingFace error: ${err.slice(0, 200)}`);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      console.log(`   HF attempt ${attempt + 1} for chunk "${text.slice(0, 30)}..."`);
+
+      const res = await fetch(HF_API, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          inputs: text,
+          options: { wait_for_model: true },
+        }),
+        signal: AbortSignal.timeout(60000),
+      });
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`HF ${res.status}: ${err.slice(0, 150)}`);
+      }
+
+      const data = await res.json();
+      if (Array.isArray(data[0])) return data[0];
+      return data;
+    } catch (err) {
+      lastError = err;
+      const msg = err instanceof Error ? err.message : "unknown";
+      console.log(`   ❌ Attempt ${attempt + 1} failed: ${msg.slice(0, 100)}`);
+
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
   }
 
-  const data = await res.json();
-  if (Array.isArray(data[0])) return data[0];
-  return data;
+  throw lastError instanceof Error ? lastError : new Error("HF embedding failed");
 }
 
 export async function POST(req: NextRequest) {
@@ -121,11 +140,11 @@ export async function POST(req: NextRequest) {
       });
 
       if ((i + 1) % 5 === 0 || i === chunks.length - 1) {
-        console.log(`   Embedded ${i + 1}/${chunks.length}`);
+        console.log(`   ✅ Embedded ${i + 1}/${chunks.length}`);
       }
 
       // Small delay to respect HF rate limits
-      if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 150));
+      if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 200));
     }
 
     console.log("💾 Inserting into database...");
