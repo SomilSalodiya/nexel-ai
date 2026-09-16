@@ -29,6 +29,63 @@ type Chapter = {
 
 type Language = "english" | "hindi" | "hinglish";
 
+// ============================================================
+// GROQ KEY ROTATION
+// ============================================================
+function getGroqKeys(): string[] {
+  return [
+    process.env.GROQ_API_KEY,
+    process.env.GROQ_API_KEY_2,
+    process.env.GROQ_API_KEY_3,
+    process.env.GROQ_API_KEY_4,
+    process.env.GROQ_API_KEY_5,
+  ].filter((k): k is string => !!k && k.startsWith("gsk_"));
+}
+
+async function callGroqWithRotation(
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens = 3500
+): Promise<string> {
+  const keys = getGroqKeys();
+  if (keys.length === 0) throw new Error("No Groq API keys configured");
+
+  const models = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"];
+
+  for (const model of models) {
+    for (const key of keys) {
+      try {
+        const groq = new Groq({ apiKey: key });
+        console.log(`  Trying ${model} with ...${key.slice(-6)}`);
+        const completion = await groq.chat.completions.create({
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.5,
+          max_tokens: maxTokens,
+        });
+        console.log(`  ✅ Success with ...${key.slice(-6)}`);
+        return completion.choices[0]?.message?.content || "";
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "";
+        if (
+          msg.includes("429") ||
+          msg.includes("rate_limit") ||
+          msg.includes("Rate limit")
+        ) {
+          console.log(`  ⚠️ ...${key.slice(-6)} rate-limited, next...`);
+          continue;
+        }
+        console.log(`  ❌ ...${key.slice(-6)} failed: ${msg.slice(0, 100)}`);
+        continue;
+      }
+    }
+  }
+  throw new Error("All Groq keys and models exhausted");
+}
+
 function parseEmbedding(raw: number[] | string): number[] {
   if (Array.isArray(raw)) return raw;
   const cleaned = raw.replace(/^\[|\]$/g, "");
@@ -53,128 +110,63 @@ function fallbackTitle(content: string): string {
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
-// ============================================================
-// ROBUST JSON EXTRACTOR — handles Hindi, Hinglish, unicode, fences
-// ============================================================
 function extractJSON(text: string): unknown {
   if (!text) return null;
-
   let cleaned = text.trim();
-  // Remove markdown code fences
   cleaned = cleaned
     .replace(/^```json\s*/i, "")
     .replace(/^```\s*/i, "")
     .replace(/```\s*$/i, "");
   cleaned = cleaned.trim();
 
-  // Direct parse
   try {
     return JSON.parse(cleaned);
-  } catch {
-    // continue
-  }
+  } catch {}
 
-  // Find first { and last }
   const firstBrace = cleaned.indexOf("{");
   const lastBrace = cleaned.lastIndexOf("}");
   if (firstBrace !== -1 && lastBrace > firstBrace) {
     const jsonStr = cleaned.slice(firstBrace, lastBrace + 1);
     try {
       return JSON.parse(jsonStr);
-    } catch {
-      // continue
-    }
-
-    // Aggressive cleanup: replace unescaped newlines inside strings
+    } catch {}
     try {
       const fixed = jsonStr.replace(
         /"((?:[^"\\]|\\.)*)"/g,
         (match) =>
-          match
-            .replace(/\n/g, "\\n")
-            .replace(/\r/g, "\\r")
-            .replace(/\t/g, "\\t")
+          match.replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t")
       );
       return JSON.parse(fixed);
-    } catch {
-      // continue
-    }
-
-    // Try replacing smart quotes
+    } catch {}
     try {
       const fixed = jsonStr
         .replace(/[\u201C\u201D]/g, '\\"')
         .replace(/[\u2018\u2019]/g, "'");
       return JSON.parse(fixed);
-    } catch {
-      // continue
-    }
+    } catch {}
   }
-
   return null;
 }
 
 function getLanguageInstruction(lang: Language): string {
   if (lang === "hindi") {
-    return `LANGUAGE: Write ALL narration in HINDI (Devanagari script).
+    return `LANGUAGE: Write ALL narration in HINDI (Devanagari).
 Example: "आज हम HTTP के बारे में सीखेंगे। यह एक प्रोटोकॉल है जिसका उपयोग वेब पर किया जाता है।"
 - Titles and bullets also in Devanagari
 - The "content" field also in Hindi
 - Keep technical terms (HTTP, HTML, CSS) in English`;
   }
   if (lang === "hinglish") {
-    return `LANGUAGE: Write ALL narration in HINGLISH — natural mix of Hindi and English.
+    return `LANGUAGE: Write ALL narration in HINGLISH — natural Hindi-English mix.
 Example: "Aaj hum HTTP ke baare mein seekhenge. Yeh ek protocol hai jiska use web par hota hai."
 - Use ROMAN script only (no Devanagari)
-- Do NOT use double quotes inside text — use single quotes or none
+- NO double quotes inside text
 - Keep technical terms (HTTP, HTML, CSS) in English`;
   }
   return "LANGUAGE: Write all narration in clear English.";
 }
 
-async function callGroq(
-  groq: Groq,
-  systemPrompt: string,
-  userPrompt: string,
-  maxTokens = 3500
-): Promise<string> {
-  try {
-    const completion = await groq.chat.completions.create({
-      model: "openai/gpt-oss-20b",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      temperature: 0.5,
-      max_tokens: maxTokens,
-    });
-    return completion.choices[0]?.message?.content || "";
-  } catch (err) {
-    console.log("20b failed:", err instanceof Error ? err.message.slice(0, 80) : "");
-  }
-  await new Promise((r) => setTimeout(r, 1200));
-  try {
-    const completion = await groq.chat.completions.create({
-      model: "openai/gpt-oss-120b",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      temperature: 0.5,
-      max_tokens: maxTokens,
-    });
-    return completion.choices[0]?.message?.content || "";
-  } catch (err) {
-    console.log("120b failed:", err instanceof Error ? err.message.slice(0, 80) : "");
-    throw err;
-  }
-}
-
-async function nameCluster(
-  groq: Groq,
-  chunks: ChunkRow[],
-  language: Language
-): Promise<string> {
+async function nameCluster(chunks: ChunkRow[], language: Language): Promise<string> {
   const sorted = [...chunks].sort((a, b) => a.chunk_index - b.chunk_index);
   const mid = Math.floor(sorted.length / 2);
   const samples = [0, mid, sorted.length - 1].filter(
@@ -186,39 +178,24 @@ async function nameCluster(
     .slice(0, 1400);
 
   let langRule = "Output ONLY a 3-5 word title in Title Case.";
-  if (language === "hindi") {
+  if (language === "hindi")
     langRule = "Output ONLY a 3-5 word title in HINDI (Devanagari script).";
-  } else if (language === "hinglish") {
-    langRule =
-      "Output ONLY a 3-5 word title in HINGLISH (Roman Hindi + English terms).";
-  }
+  else if (language === "hinglish")
+    langRule = "Output ONLY a 3-5 word title in HINGLISH (Roman Hindi + English terms).";
 
-  for (const model of ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]) {
-    try {
-      const completion = await groq.chat.completions.create({
-        model,
-        messages: [
-          {
-            role: "system",
-            content: `You name textbook chapters. ${langRule} No quotes, no period. Output ONLY the title text.`,
-          },
-          { role: "user", content },
-        ],
-        temperature: 0.3,
-        max_tokens: 80,
-      });
-      const raw = (completion.choices[0]?.message?.content || "").trim();
-      const title = raw.replace(/^["'\s.]+|["'\s.]+$/g, "").split("\n")[0].trim();
-      if (title.length >= 3 && title.length <= 80) return title;
-    } catch {
-      await new Promise((r) => setTimeout(r, 600));
-    }
-  }
+  try {
+    const raw = await callGroqWithRotation(
+      `You name textbook chapters. ${langRule} No quotes, no period. Output ONLY the title text.`,
+      content,
+      80
+    );
+    const title = raw.trim().replace(/^["'\s.]+|["'\s.]+$/g, "").split("\n")[0].trim();
+    if (title.length >= 3 && title.length <= 80) return title;
+  } catch {}
   return fallbackTitle(chunks[0].content);
 }
 
 async function generateTopicScenes(
-  groq: Groq,
   title: string,
   content: string,
   topicIdx: number,
@@ -231,7 +208,7 @@ async function generateTopicScenes(
 
 ${langInstruction}
 
-RETURN ONLY VALID JSON. No markdown. No code fences. No explanation before or after.
+RETURN ONLY VALID JSON. No markdown. No code fences.
 
 Structure:
 {
@@ -245,29 +222,28 @@ Structure:
   ]
 }
 
-CRITICAL RULES:
+CRITICAL:
 - EXACTLY 6 scenes: title, teach, bullets, pie, bullets, recap
 - Pie data: 3-4 categories summing to 100
 - Narrations: 60-90 words each
-- Never use unescaped double quotes inside string values — use single quotes or omit
+- Never use unescaped double quotes inside strings
 - Never include newlines inside string values
-- Start response with { and end with }`;
+- Start with { and end with }`;
 
   const userPrompt = `Topic: "${title}" (Unit ${topicIdx + 1} of ${totalTopics})
 
 Content:
 ${content}
 
-Return the JSON now in ${language}.`;
+Return JSON now in ${language}.`;
 
-  const raw = await callGroq(groq, systemPrompt, userPrompt, 3500);
-
-  console.log(`    Raw response (first 150 chars): ${raw.slice(0, 150)}`);
+  const raw = await callGroqWithRotation(systemPrompt, userPrompt, 3500);
+  console.log(`    Raw response (first 150): ${raw.slice(0, 150)}`);
 
   const parsed = extractJSON(raw) as { scenes?: Scene[] } | null;
 
   if (!parsed || !parsed.scenes || !Array.isArray(parsed.scenes)) {
-    console.log(`    ⚠️ JSON parse failed for "${title}", using fallback`);
+    console.log(`    ⚠️ JSON parse failed, using fallback`);
     return [
       {
         type: "title",
@@ -309,18 +285,16 @@ Return the JSON now in ${language}.`;
     (s) => s && typeof s === "object" && "type" in s && "narration" in s
   );
 
-  if (scenes.length === 0) {
-    return [
-      {
-        type: "title",
-        title,
-        subtitle: `Unit ${topicIdx + 1}`,
-        narration: `Let's explore ${title}.`,
-      },
-    ];
-  }
-
-  return scenes;
+  return scenes.length > 0
+    ? scenes
+    : [
+        {
+          type: "title",
+          title,
+          subtitle: `Unit ${topicIdx + 1}`,
+          narration: `Let's explore ${title}.`,
+        },
+      ];
 }
 
 export async function POST(req: NextRequest) {
@@ -384,8 +358,6 @@ export async function POST(req: NextRequest) {
       (a, b) => a[0].chunk_index - b[0].chunk_index
     );
 
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
     const allScenes: Scene[] = [];
     const chapters: Chapter[] = [];
 
@@ -411,7 +383,7 @@ export async function POST(req: NextRequest) {
     for (let i = 0; i < sortedClusters.length; i++) {
       const cluster = sortedClusters[i];
       console.log(`  Topic ${i + 1}/${sortedClusters.length}: naming...`);
-      const title = await nameCluster(groq, cluster, language);
+      const title = await nameCluster(cluster, language);
       console.log(`    → "${title}"`);
 
       const content = cluster
@@ -422,7 +394,6 @@ export async function POST(req: NextRequest) {
 
       console.log(`    Generating 6 scenes in ${language}...`);
       const scenes = await generateTopicScenes(
-        groq,
         title,
         content,
         i,

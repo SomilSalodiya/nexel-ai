@@ -5,6 +5,50 @@ import Groq from "groq-sdk";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
+function getGroqKeys(): string[] {
+  return [
+    process.env.GROQ_API_KEY,
+    process.env.GROQ_API_KEY_2,
+    process.env.GROQ_API_KEY_3,
+    process.env.GROQ_API_KEY_4,
+    process.env.GROQ_API_KEY_5,
+  ].filter((k): k is string => !!k && k.startsWith("gsk_"));
+}
+
+async function callGroqWithRotation(
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens = 2000
+): Promise<string> {
+  const keys = getGroqKeys();
+  if (keys.length === 0) throw new Error("No Groq API keys configured");
+
+  const models = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"];
+
+  for (const model of models) {
+    for (const key of keys) {
+      try {
+        const groq = new Groq({ apiKey: key });
+        const completion = await groq.chat.completions.create({
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.5,
+          max_tokens: maxTokens,
+        });
+        return completion.choices[0]?.message?.content || "";
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "";
+        if (msg.includes("429") || msg.includes("rate_limit")) continue;
+        continue;
+      }
+    }
+  }
+  throw new Error("All Groq keys exhausted");
+}
+
 export async function POST(req: NextRequest) {
   try {
     const supabase = await createClient();
@@ -15,8 +59,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
     }
 
-    const body = await req.json();
-    const { filePath, fileName, numQuestions = 5 } = body as {
+    const { filePath, fileName, numQuestions = 5 } = (await req.json()) as {
       filePath: string;
       fileName: string;
       numQuestions?: number;
@@ -26,7 +69,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Missing filePath" }, { status: 400 });
     }
 
-    // Fetch chunks for this PDF
     const { data: chunks, error: chunkError } = await supabase
       .from("pdf_chunks")
       .select("content")
@@ -36,87 +78,59 @@ export async function POST(req: NextRequest) {
       .limit(15);
 
     if (chunkError) {
-      return NextResponse.json(
-        { error: `Failed to load content: ${chunkError.message}` },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: `Failed to load: ${chunkError.message}` }, { status: 500 });
     }
-
     if (!chunks || chunks.length === 0) {
       return NextResponse.json(
-        {
-          error:
-            "This PDF hasn't been processed yet. Open it and click 'Analyze this PDF' first.",
-        },
+        { error: "This PDF hasn't been processed yet. Analyze it first." },
         { status: 400 }
       );
     }
 
-    // Combine chunks (cap at ~6000 chars to stay within model context)
-    const combinedContent = chunks
-      .map((c) => c.content)
-      .join("\n\n")
-      .slice(0, 6000);
+    const combinedContent = chunks.map((c) => c.content).join("\n\n").slice(0, 6000);
 
-    // Ask Groq for quiz questions
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const systemPrompt = `You are an expert quiz generator. Generate ${numQuestions} multiple-choice questions from the given content.
 
-    const completion = await groq.chat.completions.create({
-      model: "openai/gpt-oss-20b",
-      messages: [
-        {
-          role: "system",
-          content: `You are an expert quiz generator. Given content from a PDF, generate ${numQuestions} multiple-choice questions that test understanding of the material.
-
-Respond ONLY with valid JSON in this exact format:
+Respond ONLY with valid JSON:
 {
   "questions": [
     {
-      "question": "The question text",
+      "question": "Question text",
       "options": ["Option A", "Option B", "Option C", "Option D"],
       "correctIndex": 0,
-      "explanation": "Brief explanation of why this is correct"
+      "explanation": "Why this is correct"
     }
   ]
 }
 
 Rules:
-- Every question must have exactly 4 options
-- correctIndex must be 0, 1, 2, or 3 (index of the correct option)
-- Questions should test understanding, not just memorization
-- Make wrong answers plausible
-- Do not include any text outside the JSON`,
-        },
-        {
-          role: "user",
-          content: `Generate ${numQuestions} quiz questions from this content:\n\n${combinedContent}`,
-        },
-      ],
-      temperature: 0.5,
-      max_tokens: 2000,
-      response_format: { type: "json_object" },
-    });
+- Exactly 4 options per question
+- correctIndex 0-3
+- No unescaped double quotes inside strings
+- No newlines inside strings`;
 
-    const content = completion.choices[0]?.message?.content || "{}";
+    const userPrompt = `Generate ${numQuestions} quiz questions from:\n\n${combinedContent}`;
+
+    const raw = await callGroqWithRotation(systemPrompt, userPrompt, 2000);
 
     let parsed;
     try {
-      parsed = JSON.parse(content);
-    } catch {
-      return NextResponse.json(
-        { error: "AI returned invalid JSON. Please try again." },
-        { status: 500 }
+      const cleaned = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+      const firstBrace = cleaned.indexOf("{");
+      const lastBrace = cleaned.lastIndexOf("}");
+      parsed = JSON.parse(
+        firstBrace !== -1 && lastBrace > firstBrace
+          ? cleaned.slice(firstBrace, lastBrace + 1)
+          : cleaned
       );
+    } catch {
+      return NextResponse.json({ error: "AI returned invalid JSON" }, { status: 500 });
     }
 
     if (!parsed.questions || !Array.isArray(parsed.questions)) {
-      return NextResponse.json(
-        { error: "AI response missing questions. Please try again." },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: "AI response missing questions" }, { status: 500 });
     }
 
-    // Validate structure
     const valid = parsed.questions.every(
       (q: { question?: string; options?: unknown; correctIndex?: unknown }) =>
         q.question &&
@@ -128,10 +142,7 @@ Rules:
     );
 
     if (!valid) {
-      return NextResponse.json(
-        { error: "AI generated invalid questions. Please try again." },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: "AI generated invalid questions" }, { status: 500 });
     }
 
     return NextResponse.json({ questions: parsed.questions });

@@ -7,23 +7,73 @@ export const maxDuration = 60;
 
 type Language = "english" | "hindi" | "hinglish";
 
+function getGroqKeys(): string[] {
+  return [
+    process.env.GROQ_API_KEY,
+    process.env.GROQ_API_KEY_2,
+    process.env.GROQ_API_KEY_3,
+    process.env.GROQ_API_KEY_4,
+    process.env.GROQ_API_KEY_5,
+  ].filter((k): k is string => !!k && k.startsWith("gsk_"));
+}
+
+async function callGroqWithRotation(
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens = 2500
+): Promise<string> {
+  const keys = getGroqKeys();
+  if (keys.length === 0) throw new Error("No Groq API keys configured");
+
+  const models = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"];
+
+  for (const model of models) {
+    for (const key of keys) {
+      try {
+        const groq = new Groq({ apiKey: key });
+        const completion = await groq.chat.completions.create({
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.6,
+          max_tokens: maxTokens,
+        });
+        return completion.choices[0]?.message?.content || "";
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "";
+        if (
+          msg.includes("429") ||
+          msg.includes("rate_limit") ||
+          msg.includes("Rate limit")
+        ) {
+          console.log(`  ⚠️ Key rate-limited, next...`);
+          continue;
+        }
+        console.log(`  ❌ Key failed: ${msg.slice(0, 100)}`);
+        continue;
+      }
+    }
+  }
+  throw new Error("All Groq keys exhausted");
+}
+
 function getLanguageInstruction(lang: Language): string {
   if (lang === "hindi") {
     return `IMPORTANT: Write ALL narration in HINDI (Devanagari script).
 Example: "आज हम HTTP के बारे में सीखेंगे। यह एक प्रोटोकॉल है जिसका उपयोग वेब पर किया जाता है।"
 - Titles and bullets in Devanagari too
-- Keep technical terms (HTTP, HTML, CSS) in English
-- Sound like a Hindi professor teaching`;
+- Keep technical terms (HTTP, HTML, CSS) in English`;
   }
   if (lang === "hinglish") {
-    return `IMPORTANT: Write ALL narration in HINGLISH — natural mix of Hindi and English.
-Example: "Aaj hum HTTP ke baare mein seekhenge. Yeh ek protocol hai jiska use web par hota hai. Client aur server ke beech communication ka kaam karta hai."
-- Use Roman script for Hindi words
-- You MAY use Devanagari for emphasis
-- Keep technical terms (HTTP, HTML, CSS) in English
-- Sound casual and friendly, like explaining to a friend`;
+    return `IMPORTANT: Write ALL narration in HINGLISH — natural Hindi-English mix.
+Example: "Aaj hum HTTP ke baare mein seekhenge. Yeh ek protocol hai jiska use web par hota hai."
+- Use Roman script only
+- NO double quotes inside text
+- Keep technical terms in English`;
   }
-  return "LANGUAGE: Write all narration in clear, natural English.";
+  return "LANGUAGE: Write all narration in clear English.";
 }
 
 export async function POST(req: NextRequest) {
@@ -82,16 +132,9 @@ export async function POST(req: NextRequest) {
 
     const langInstruction = getLanguageInstruction(language);
 
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const systemPrompt = `You are an expert educational video scriptwriter. Given content from a PDF, create a 6-scene study video script.
 
-    const completion = await groq.chat.completions.create({
-      model: "openai/gpt-oss-20b",
-      messages: [
-        {
-          role: "system",
-          content: `You are an expert educational video scriptwriter. Given content from a PDF, create a short 6-scene study video script.
-
-Respond ONLY with valid JSON in this exact format:
+Respond ONLY with valid JSON in this format:
 {
   "title": "Overall video title",
   "scenes": [
@@ -106,41 +149,31 @@ Respond ONLY with valid JSON in this exact format:
 
 ${langInstruction}
 
-SCENE REQUIREMENTS:
-- EXACTLY 6 scenes
-- Scene 1: title
-- Scene 2: teach
-- Scene 3: bullets
-- Scene 4: pie (3-4 categories summing to 100)
-- Scene 5: bullets
-- Scene 6: recap
+RULES:
+- EXACTLY 6 scenes: title, teach, bullets, pie, bullets, recap
+- Pie data: 3-4 categories summing to 100
+- Narrations: 60-90 words each
+- No unescaped double quotes inside strings
+- No newlines inside string values`;
 
-PIE CHART RULES:
-- 3-4 categories, values sum to 100
-- Labels short (< 15 chars)
+    const userPrompt = `Create a 6-scene study video script from this PDF content titled "${fileName}" in ${language}:\n\n${combinedContent}`;
 
-NARRATION RULES:
-- 60-90 words per scene (30-45 seconds spoken)
-- Natural and conversational
-- For Hindi/Hinglish use "hum", "aap", "chaliye"
-
-Do not include any text outside the JSON.`,
-        },
-        {
-          role: "user",
-          content: `Create a 6-scene study video script from this PDF content titled "${fileName}" in ${language}:\n\n${combinedContent}`,
-        },
-      ],
-      temperature: 0.6,
-      max_tokens: 2500,
-      response_format: { type: "json_object" },
-    });
-
-    const content = completion.choices[0]?.message?.content || "{}";
+    const content = await callGroqWithRotation(systemPrompt, userPrompt, 2500);
 
     let parsed;
     try {
-      parsed = JSON.parse(content);
+      const cleaned = content
+        .replace(/^```json\s*/i, "")
+        .replace(/^```\s*/i, "")
+        .replace(/```\s*$/i, "")
+        .trim();
+      const firstBrace = cleaned.indexOf("{");
+      const lastBrace = cleaned.lastIndexOf("}");
+      if (firstBrace !== -1 && lastBrace > firstBrace) {
+        parsed = JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+      } else {
+        parsed = JSON.parse(cleaned);
+      }
     } catch {
       return NextResponse.json(
         { error: "AI returned invalid JSON. Please try again." },

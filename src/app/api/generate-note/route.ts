@@ -5,76 +5,107 @@ import Groq from "groq-sdk";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
+function getGroqKeys(): string[] {
+  return [
+    process.env.GROQ_API_KEY,
+    process.env.GROQ_API_KEY_2,
+    process.env.GROQ_API_KEY_3,
+    process.env.GROQ_API_KEY_4,
+    process.env.GROQ_API_KEY_5,
+  ].filter((k): k is string => !!k && k.startsWith("gsk_"));
+}
+
+async function callGroqWithRotation(
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens = 800
+): Promise<string> {
+  const keys = getGroqKeys();
+  if (keys.length === 0) throw new Error("No Groq API keys configured");
+
+  const models = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"];
+
+  for (const model of models) {
+    for (const key of keys) {
+      try {
+        const groq = new Groq({ apiKey: key });
+        const completion = await groq.chat.completions.create({
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.4,
+          max_tokens: maxTokens,
+        });
+        return completion.choices[0]?.message?.content || "";
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "";
+        if (msg.includes("429") || msg.includes("rate_limit")) continue;
+        continue;
+      }
+    }
+  }
+  throw new Error("All Groq keys exhausted");
+}
+
 export async function POST(req: NextRequest) {
   try {
     const supabase = await createClient();
-    const { data: { user } } = await supabase.auth.getUser();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
     if (!user) {
       return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
     }
 
-    const body = await req.json();
-    const { selectedText, filePath, fileName } = body as {
+    const { selectedText, filePath, fileName } = (await req.json()) as {
       selectedText: string;
       filePath: string;
       fileName: string;
     };
 
     if (!selectedText || selectedText.trim().length < 20) {
-      return NextResponse.json(
-        { error: "Please select or paste at least 20 characters" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Please paste at least 20 characters" }, { status: 400 });
     }
-
     if (selectedText.length > 5000) {
-      return NextResponse.json(
-        { error: "Text too long. Please keep it under 5000 characters." },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Text too long (max 5000 chars)" }, { status: 400 });
     }
 
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const systemPrompt = `You are an expert study assistant. Generate study materials from text.
 
-    const completion = await groq.chat.completions.create({
-      model: "openai/gpt-oss-20b",
-      messages: [
-        {
-          role: "system",
-          content: `You are an expert study assistant. Given a piece of text from a PDF, generate study materials. Respond ONLY with valid JSON in this exact format:
-
+Respond ONLY with valid JSON:
 {
-  "summary": "A 2-3 sentence summary of the key idea",
+  "summary": "2-3 sentence summary",
   "bullets": ["Key point 1", "Key point 2", "Key point 3", "Key point 4"],
-  "simplified": "Explain this concept in simple, beginner-friendly language (2-3 sentences)",
+  "simplified": "Simple beginner-friendly explanation",
   "flashcard": {
-    "question": "A single quiz-style question about this content",
+    "question": "A quiz-style question",
     "answer": "The concise answer"
   }
 }
 
-Do not include any text outside the JSON. Do not use markdown code fences.`,
-        },
-        {
-          role: "user",
-          content: `Text from PDF "${fileName}":\n\n${selectedText}`,
-        },
-      ],
-      temperature: 0.4,
-      max_tokens: 800,
-      response_format: { type: "json_object" },
-    });
+Rules:
+- No unescaped double quotes inside strings
+- No newlines inside string values
+- Start with { and end with }`;
 
-    const content = completion.choices[0]?.message?.content || "{}";
+    const userPrompt = `Text from PDF "${fileName}":\n\n${selectedText}`;
+
+    const raw = await callGroqWithRotation(systemPrompt, userPrompt, 800);
 
     let parsed;
     try {
-      parsed = JSON.parse(content);
-    } catch {
-      return NextResponse.json(
-        { error: "AI returned invalid JSON. Please try again." },
-        { status: 500 }
+      const cleaned = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+      const firstBrace = cleaned.indexOf("{");
+      const lastBrace = cleaned.lastIndexOf("}");
+      parsed = JSON.parse(
+        firstBrace !== -1 && lastBrace > firstBrace
+          ? cleaned.slice(firstBrace, lastBrace + 1)
+          : cleaned
       );
+    } catch {
+      return NextResponse.json({ error: "AI returned invalid JSON" }, { status: 500 });
     }
 
     const { data: inserted, error: insertError } = await supabase
@@ -93,10 +124,7 @@ Do not include any text outside the JSON. Do not use markdown code fences.`,
       .single();
 
     if (insertError) {
-      return NextResponse.json(
-        { error: `Save failed: ${insertError.message}` },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: `Save failed: ${insertError.message}` }, { status: 500 });
     }
 
     return NextResponse.json({ success: true, note: inserted });

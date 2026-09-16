@@ -11,6 +11,16 @@ export const maxDuration = 60;
 const JINA_API = "https://api.jina.ai/v1/embeddings";
 const JINA_MODEL = "jina-embeddings-v2-base-en";
 
+function getGroqKeys(): string[] {
+  return [
+    process.env.GROQ_API_KEY,
+    process.env.GROQ_API_KEY_2,
+    process.env.GROQ_API_KEY_3,
+    process.env.GROQ_API_KEY_4,
+    process.env.GROQ_API_KEY_5,
+  ].filter((k): k is string => !!k && k.startsWith("gsk_"));
+}
+
 async function getQueryEmbedding(text: string): Promise<number[]> {
   const apiKey = process.env.JINA_API_KEY;
   if (!apiKey) throw new Error("JINA_API_KEY not configured");
@@ -21,17 +31,9 @@ async function getQueryEmbedding(text: string): Promise<number[]> {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: JINA_MODEL,
-      input: [text],
-    }),
+    body: JSON.stringify({ model: JINA_MODEL, input: [text] }),
   });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Jina error ${res.status}: ${err.slice(0, 200)}`);
-  }
-
+  if (!res.ok) throw new Error(await res.text());
   const data = await res.json();
   return data.data[0].embedding;
 }
@@ -42,9 +44,7 @@ export async function POST(req: NextRequest) {
     const {
       data: { user },
     } = await supabase.auth.getUser();
-    if (!user) {
-      return new Response("Not authenticated", { status: 401 });
-    }
+    if (!user) return new Response("Not authenticated", { status: 401 });
 
     const { question, filePath, fileName } = await req.json();
     if (!question || !filePath) {
@@ -60,46 +60,56 @@ export async function POST(req: NextRequest) {
       match_count: 5,
     });
 
-    if (matchError) {
-      return new Response(`Search error: ${matchError.message}`, { status: 500 });
-    }
-
+    if (matchError) return new Response(`Search error: ${matchError.message}`, { status: 500 });
     if (!matches || matches.length === 0) {
-      return new Response("No content found in this PDF. Please process it first.", {
-        status: 404,
-      });
+      return new Response("No content found in this PDF. Please process it first.", { status: 404 });
     }
 
     const context = matches
-      .map((m: { content: string }, i: number) =>
-        `[Source ${i + 1}]\n${m.content}`
-      )
+      .map((m: { content: string }, i: number) => `[Source ${i + 1}]\n${m.content}`)
       .join("\n\n");
 
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const keys = getGroqKeys();
+    if (keys.length === 0) throw new Error("No Groq API keys configured");
 
-    const stream = await groq.chat.completions.create({
-      model: "openai/gpt-oss-20b",
-      messages: [
-        {
-          role: "system",
-          content: `You are a helpful study assistant. Answer the user's question using ONLY the provided context from their PDF "${fileName}". If the answer isn't in the context, say so honestly. Be concise and clear. When useful, mention which source(s) you used.`,
-        },
-        {
-          role: "user",
-          content: `Context from the PDF:\n\n${context}\n\n---\n\nQuestion: ${question}`,
-        },
-      ],
-      temperature: 0.3,
-      max_tokens: 800,
-      stream: true,
-    });
+    let stream: AsyncIterable<Groq.Chat.Completions.ChatCompletionChunk> | null = null;
+    let lastError: unknown;
+
+    outer: for (const key of keys) {
+      try {
+        const groq = new Groq({ apiKey: key });
+        stream = await groq.chat.completions.create({
+          model: "openai/gpt-oss-20b",
+          messages: [
+            {
+              role: "system",
+              content: `You are a helpful study assistant. Answer using ONLY the context from the PDF "${fileName}". Be concise and clear.`,
+            },
+            {
+              role: "user",
+              content: `Context:\n\n${context}\n\n---\n\nQuestion: ${question}`,
+            },
+          ],
+          temperature: 0.3,
+          max_tokens: 800,
+          stream: true,
+        });
+        break outer;
+      } catch (err) {
+        lastError = err;
+        const msg = err instanceof Error ? err.message : "";
+        if (msg.includes("429") || msg.includes("rate_limit")) continue;
+        continue;
+      }
+    }
+
+    if (!stream) throw lastError || new Error("All keys failed");
 
     const encoder = new TextEncoder();
     const readable = new ReadableStream({
       async start(controller) {
         try {
-          for await (const chunk of stream) {
+          for await (const chunk of stream!) {
             const text = chunk.choices[0]?.delta?.content || "";
             if (text) controller.enqueue(encoder.encode(text));
           }
