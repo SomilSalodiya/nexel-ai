@@ -1,3 +1,6 @@
+import dns from "node:dns";
+dns.setDefaultResultOrder("ipv4first");
+
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { extractText, getDocumentProxy } from "unpdf";
@@ -7,17 +10,8 @@ export const maxDuration = 300;
 
 const CHUNK_SIZE = 1000;
 const CHUNK_OVERLAP = 200;
-const MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
-
-// Lazy-loaded pipeline (loads model once per server process)
-let embedderPipeline: ((text: string, opts: object) => Promise<{ data: Float32Array }>) | null = null;
-
-async function getEmbedder() {
-  if (embedderPipeline) return embedderPipeline;
-  const { pipeline } = await import("@xenova/transformers");
-  embedderPipeline = (await pipeline("feature-extraction", MODEL_NAME)) as never;
-  return embedderPipeline;
-}
+const HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
+const HF_API = `https://api-inference.huggingface.co/pipeline/feature-extraction/${HF_MODEL}`;
 
 function chunkText(text: string): string[] {
   const chunks: string[] = [];
@@ -32,15 +26,34 @@ function chunkText(text: string): string[] {
 }
 
 async function getEmbedding(text: string): Promise<number[]> {
-  const embedder = await getEmbedder();
-  const output = await embedder(text, { pooling: "mean", normalize: true });
-  return Array.from(output.data);
+  const res = await fetch(HF_API, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      inputs: text,
+      options: { wait_for_model: true },
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`HuggingFace error: ${err.slice(0, 200)}`);
+  }
+
+  const data = await res.json();
+  if (Array.isArray(data[0])) return data[0];
+  return data;
 }
 
 export async function POST(req: NextRequest) {
   try {
     const supabase = await createClient();
-    const { data: { user } } = await supabase.auth.getUser();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
     if (!user) {
       return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
     }
@@ -52,6 +65,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Missing filePath or fileName" }, { status: 400 });
     }
 
+    // Check if already processed
     const { count } = await supabase
       .from("pdf_chunks")
       .select("*", { count: "exact", head: true })
@@ -62,6 +76,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: true, chunks: count, cached: true });
     }
 
+    // Download PDF from storage
     const { data: fileData, error: downloadError } = await supabase.storage
       .from("pdfs")
       .download(filePath);
@@ -73,8 +88,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    console.log("📥 Downloaded PDF, extracting text...");
     const buffer = new Uint8Array(await fileData.arrayBuffer());
+
+    console.log("📥 Extracting text...");
     const pdf = await getDocumentProxy(buffer);
     const { text: extracted, totalPages } = await extractText(pdf, { mergePages: true });
     const text = Array.isArray(extracted) ? extracted.join("\n") : extracted;
@@ -84,20 +100,17 @@ export async function POST(req: NextRequest) {
     }
 
     const chunks = chunkText(text);
-    console.log(`✂️  Created ${chunks.length} chunks from ${totalPages} pages`);
+    console.log(`✂️ Created ${chunks.length} chunks from ${totalPages} pages`);
 
     if (chunks.length === 0) {
       return NextResponse.json({ error: "No chunks created" }, { status: 400 });
     }
 
-    console.log("🤖 Loading embedding model (first time only, may take 1 min)...");
-    const embedder = await getEmbedder();
-    console.log("✅ Model loaded");
+    console.log("🤖 Getting embeddings via HuggingFace API...");
 
     const records = [];
     for (let i = 0; i < chunks.length; i++) {
-      const output = await embedder(chunks[i], { pooling: "mean", normalize: true });
-      const embedding = Array.from(output.data) as number[];
+      const embedding = await getEmbedding(chunks[i]);
       records.push({
         user_id: user.id,
         file_path: filePath,
@@ -106,7 +119,13 @@ export async function POST(req: NextRequest) {
         content: chunks[i],
         embedding: embedding,
       });
-      if ((i + 1) % 10 === 0) console.log(`   Embedded ${i + 1}/${chunks.length}`);
+
+      if ((i + 1) % 5 === 0 || i === chunks.length - 1) {
+        console.log(`   Embedded ${i + 1}/${chunks.length}`);
+      }
+
+      // Small delay to respect HF rate limits
+      if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 150));
     }
 
     console.log("💾 Inserting into database...");

@@ -1,25 +1,37 @@
+import dns from "node:dns";
+dns.setDefaultResultOrder("ipv4first");
+
 import { NextRequest } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import Groq from "groq-sdk";
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 60;
 
-const MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
+const HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
+const HF_API = `https://api-inference.huggingface.co/pipeline/feature-extraction/${HF_MODEL}`;
 
-let embedderPipeline: ((text: string, opts: object) => Promise<{ data: Float32Array }>) | null = null;
-
-async function getEmbedder() {
-  if (embedderPipeline) return embedderPipeline;
-  const { pipeline } = await import("@xenova/transformers");
-  embedderPipeline = (await pipeline("feature-extraction", MODEL_NAME)) as never;
-  return embedderPipeline;
+async function getQueryEmbedding(text: string): Promise<number[]> {
+  const res = await fetch(HF_API, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  if (Array.isArray(data[0])) return data[0];
+  return data;
 }
 
 export async function POST(req: NextRequest) {
   try {
     const supabase = await createClient();
-    const { data: { user } } = await supabase.auth.getUser();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
     if (!user) {
       return new Response("Not authenticated", { status: 401 });
     }
@@ -29,10 +41,10 @@ export async function POST(req: NextRequest) {
       return new Response("Missing question or filePath", { status: 400 });
     }
 
-    const embedder = await getEmbedder();
-    const output = await embedder(question, { pooling: "mean", normalize: true });
-    const queryEmbedding = Array.from(output.data) as number[];
+    // Get embedding for the question via HuggingFace
+    const queryEmbedding = await getQueryEmbedding(question);
 
+    // Find relevant chunks
     const { data: matches, error: matchError } = await supabase.rpc("match_pdf_chunks", {
       query_embedding: queryEmbedding,
       match_user_id: user.id,
@@ -51,17 +63,19 @@ export async function POST(req: NextRequest) {
     }
 
     const context = matches
-      .map((m: { content: string }, i: number) => `[Source ${i + 1}]\n${m.content}`)
+      .map((m: { content: string }, i: number) =>
+        `[Source ${i + 1}]\n${m.content}`
+      )
       .join("\n\n");
 
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
     const stream = await groq.chat.completions.create({
-    model: "openai/gpt-oss-20b",
+      model: "openai/gpt-oss-20b",
       messages: [
         {
           role: "system",
-          content: `You are a helpful study assistant. Answer the user's question using ONLY the provided context from their PDF "${fileName}". If the answer isn't in the context, say so honestly. Be concise and clear.`,
+          content: `You are a helpful study assistant. Answer the user's question using ONLY the provided context from their PDF "${fileName}". If the answer isn't in the context, say so honestly. Be concise and clear. When useful, mention which source(s) you used.`,
         },
         {
           role: "user",
