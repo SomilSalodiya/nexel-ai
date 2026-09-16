@@ -10,8 +10,8 @@ export const maxDuration = 300;
 
 const CHUNK_SIZE = 1000;
 const CHUNK_OVERLAP = 200;
-const HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
-const HF_API = `https://api-inference.huggingface.co/pipeline/feature-extraction/${HF_MODEL}`;
+const JINA_API = "https://api.jina.ai/v1/embeddings";
+const JINA_MODEL = "jina-embeddings-v2-small-en"; // 512 dims
 
 function chunkText(text: string): string[] {
   const chunks: string[] = [];
@@ -25,46 +25,31 @@ function chunkText(text: string): string[] {
   return chunks;
 }
 
-async function getEmbedding(text: string): Promise<number[]> {
-  let lastError: unknown;
+// Batch embeddings — Jina accepts multiple inputs at once
+async function getEmbeddingsBatch(texts: string[]): Promise<number[][]> {
+  const apiKey = process.env.JINA_API_KEY;
+  if (!apiKey) throw new Error("JINA_API_KEY not configured");
 
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      console.log(`   HF attempt ${attempt + 1} for chunk "${text.slice(0, 30)}..."`);
+  const res = await fetch(JINA_API, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: JINA_MODEL,
+      input: texts,
+    }),
+  });
 
-      const res = await fetch(HF_API, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          inputs: text,
-          options: { wait_for_model: true },
-        }),
-        signal: AbortSignal.timeout(60000),
-      });
-
-      if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`HF ${res.status}: ${err.slice(0, 150)}`);
-      }
-
-      const data = await res.json();
-      if (Array.isArray(data[0])) return data[0];
-      return data;
-    } catch (err) {
-      lastError = err;
-      const msg = err instanceof Error ? err.message : "unknown";
-      console.log(`   ❌ Attempt ${attempt + 1} failed: ${msg.slice(0, 100)}`);
-
-      if (attempt < 2) {
-        await new Promise((r) => setTimeout(r, 2000));
-      }
-    }
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Jina error ${res.status}: ${err.slice(0, 200)}`);
   }
 
-  throw lastError instanceof Error ? lastError : new Error("HF embedding failed");
+  const data = await res.json();
+  const embeddings = data.data.map((d: { embedding: number[] }) => d.embedding);
+  return embeddings;
 }
 
 export async function POST(req: NextRequest) {
@@ -95,7 +80,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: true, chunks: count, cached: true });
     }
 
-    // Download PDF from storage
+    // Download PDF
     const { data: fileData, error: downloadError } = await supabase.storage
       .from("pdfs")
       .download(filePath);
@@ -125,26 +110,35 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "No chunks created" }, { status: 400 });
     }
 
-    console.log("🤖 Getting embeddings via HuggingFace API...");
+    // Process in batches of 32 (Jina supports up to 2048 inputs, but batches keep requests small)
+    console.log("🤖 Getting embeddings via Jina AI...");
+    const BATCH_SIZE = 32;
+    const records: Record<string, unknown>[] = [];
 
-    const records = [];
-    for (let i = 0; i < chunks.length; i++) {
-      const embedding = await getEmbedding(chunks[i]);
-      records.push({
-        user_id: user.id,
-        file_path: filePath,
-        file_name: fileName,
-        chunk_index: i,
-        content: chunks[i],
-        embedding: embedding,
-      });
+    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+      const batch = chunks.slice(i, i + BATCH_SIZE);
+      console.log(`   Batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} chunks)...`);
 
-      if ((i + 1) % 5 === 0 || i === chunks.length - 1) {
-        console.log(`   ✅ Embedded ${i + 1}/${chunks.length}`);
+      try {
+        const embeddings = await getEmbeddingsBatch(batch);
+
+        for (let j = 0; j < batch.length; j++) {
+          records.push({
+            user_id: user.id,
+            file_path: filePath,
+            file_name: fileName,
+            chunk_index: i + j,
+            content: batch[j],
+            embedding: embeddings[j],
+          });
+        }
+
+        console.log(`   ✅ Embedded ${Math.min(i + BATCH_SIZE, chunks.length)}/${chunks.length}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "unknown";
+        console.log(`   ❌ Batch failed: ${msg.slice(0, 100)}`);
+        throw err;
       }
-
-      // Small delay to respect HF rate limits
-      if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 200));
     }
 
     console.log("💾 Inserting into database...");

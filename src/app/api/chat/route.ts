@@ -8,22 +8,32 @@ import Groq from "groq-sdk";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
-const HF_API = `https://api-inference.huggingface.co/pipeline/feature-extraction/${HF_MODEL}`;
+const JINA_API = "https://api.jina.ai/v1/embeddings";
+const JINA_MODEL = "jina-embeddings-v2-small-en";
 
 async function getQueryEmbedding(text: string): Promise<number[]> {
-  const res = await fetch(HF_API, {
+  const apiKey = process.env.JINA_API_KEY;
+  if (!apiKey) throw new Error("JINA_API_KEY not configured");
+
+  const res = await fetch(JINA_API, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
+    body: JSON.stringify({
+      model: JINA_MODEL,
+      input: [text],
+    }),
   });
-  if (!res.ok) throw new Error(await res.text());
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Jina error ${res.status}: ${err.slice(0, 200)}`);
+  }
+
   const data = await res.json();
-  if (Array.isArray(data[0])) return data[0];
-  return data;
+  return data.data[0].embedding;
 }
 
 export async function POST(req: NextRequest) {
@@ -41,10 +51,8 @@ export async function POST(req: NextRequest) {
       return new Response("Missing question or filePath", { status: 400 });
     }
 
-    // Get embedding for the question via HuggingFace
     const queryEmbedding = await getQueryEmbedding(question);
 
-    // Find relevant chunks
     const { data: matches, error: matchError } = await supabase.rpc("match_pdf_chunks", {
       query_embedding: queryEmbedding,
       match_user_id: user.id,
