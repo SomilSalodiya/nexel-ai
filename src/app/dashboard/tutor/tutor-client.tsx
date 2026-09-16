@@ -20,13 +20,11 @@ import {
   MessageSquare,
   Mic,
   MicOff,
-  Globe,
   ChevronDown,
   Volume2,
   VolumeX,
   Paperclip,
   X,
-  Image as ImageIcon,
 } from "lucide-react";
 import { initVoices, speakText as speak, stopSpeaking as stop } from "@/lib/voice";
 
@@ -41,7 +39,7 @@ type Message = {
   content: string;
   sources?: { file_name: string; snippet: string; similarity: number }[];
   attachment?: Attachment;
-  previewUrl?: string; // for image thumbnails
+  previewUrl?: string;
 };
 
 type LangCode = "auto" | "en-IN" | "hi-IN";
@@ -55,11 +53,10 @@ const LANGUAGES: { code: LangCode; label: string; flag: string }[] = [
 const SUGGESTIONS = [
   { icon: Lightbulb, title: "Explain a concept", prompt: "Explain the most important concept from my PDFs in simple terms" },
   { icon: MessageSquare, title: "Summarize a topic", prompt: "Summarize the main topics covered across all my PDFs" },
-  { icon: GraduationCap, title: "Help me study", prompt: "Quiz me on the key concepts from my PDFs — ask me one question at a time" },
+  { icon: GraduationCap, title: "Help me study", prompt: "Quiz me on the key concepts from my PDFs" },
   { icon: Microscope, title: "Ask me anything", prompt: "Explain quantum physics in simple terms" },
 ];
 
-// ============ SPEECH RECOGNITION TYPES ============
 type SpeechRecognitionEvent = Event & {
   results: {
     length: number;
@@ -90,8 +87,7 @@ type SpeechRecognitionInstance = {
 type SpeechRecognitionCtor = new () => SpeechRecognitionInstance;
 
 function detectLanguage(text: string): "hi-IN" | "en-IN" {
-  const devanagariRegex = /[\u0900-\u097F]/;
-  return devanagariRegex.test(text) ? "hi-IN" : "en-IN";
+  return /[\u0900-\u097F]/.test(text) ? "hi-IN" : "en-IN";
 }
 
 function formatFileSize(bytes: number): string {
@@ -111,12 +107,8 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
   const [showLangMenu, setShowLangMenu] = useState(false);
   const [voiceSupported, setVoiceSupported] = useState(true);
   const [voiceError, setVoiceError] = useState("");
-
-  // Voice reply
   const [speakReplies, setSpeakReplies] = useState(false);
   const [currentlySpeakingId, setCurrentlySpeakingId] = useState<number | null>(null);
-
-  // Attachment
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [pendingPreview, setPendingPreview] = useState<string>("");
 
@@ -279,18 +271,15 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
 
     const validTypes = ["image/jpeg", "image/png", "image/webp", "image/gif", "application/pdf"];
     if (!validTypes.includes(file.type)) {
-      alert("Only images (JPG, PNG, WEBP, GIF) and PDFs are supported");
+      alert("Only images and PDFs are supported");
       return;
     }
 
     setPendingFile(file);
 
-    // Preview for images
     if (file.type.startsWith("image/")) {
       const reader = new FileReader();
-      reader.onload = (ev) => {
-        setPendingPreview(ev.target?.result as string);
-      };
+      reader.onload = (ev) => setPendingPreview(ev.target?.result as string);
       reader.readAsDataURL(file);
     } else {
       setPendingPreview("");
@@ -303,7 +292,23 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
-  // ============ SEND MESSAGE ============
+  // ============ PARSE __META__ PREFIX ============
+  function parseMeta(chunk: string): { cleanText: string; meta: Record<string, unknown> | null } {
+    if (chunk.startsWith("__META__")) {
+      const end = chunk.indexOf("__META__", 8);
+      if (end > 8) {
+        try {
+          const meta = JSON.parse(chunk.slice(8, end));
+          return { cleanText: chunk.slice(end + 8), meta };
+        } catch {
+          return { cleanText: chunk, meta: null };
+        }
+      }
+    }
+    return { cleanText: chunk, meta: null };
+  }
+
+  // ============ SEND ============
   async function sendMessage(text: string) {
     if ((!text.trim() && !pendingFile) || loading) return;
     if (listening) stopListening();
@@ -316,7 +321,6 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
     setInput("");
     clearPendingFile();
 
-    // Add user message
     setMessages((prev) => [
       ...prev,
       {
@@ -333,7 +337,6 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
       },
     ]);
 
-    // Add empty assistant message
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
     setLoading(true);
     setStreaming(true);
@@ -342,16 +345,13 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
     abortRef.current = controller;
 
     try {
-      // Use vision endpoint if file attached, else text endpoint
       let res: Response;
 
       if (fileToSend) {
         const formData = new FormData();
         formData.append("file", fileToSend);
         formData.append("question", question);
-        if (conversationId) {
-          formData.append("conversationId", String(conversationId));
-        }
+        if (conversationId) formData.append("conversationId", String(conversationId));
 
         res = await fetch("/api/tutor/vision", {
           method: "POST",
@@ -372,30 +372,34 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
         throw new Error(errText || "Request failed");
       }
 
-      let sources: { file_name: string; snippet: string; similarity: number }[] = [];
-      const srcHeader = res.headers.get("X-Sources");
-      if (srcHeader) {
-        try { sources = JSON.parse(srcHeader); } catch {}
-      }
-
       const reader = res.body?.getReader();
       const decoder = new TextDecoder();
       if (!reader) throw new Error("No response body");
 
       let accumulated = "";
+      let sources: { file_name: string; snippet: string; similarity: number }[] = [];
       let metaParsed = false;
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+
         let text = decoder.decode(value, { stream: true });
 
-        // Parse __META__ prefix if present (only for vision)
-        if (!metaParsed && text.includes("__META__")) {
-          const metaEnd = text.indexOf("__META__", 8);
-          if (metaEnd > 8) {
-            text = text.slice(metaEnd + 8);
+        // Parse __META__ prefix if we haven't yet
+        if (!metaParsed && text.startsWith("__META__")) {
+          const end = text.indexOf("__META__", 8);
+          if (end > 8) {
+            try {
+              const meta = JSON.parse(text.slice(8, end));
+              if (meta.sources) {
+                sources = meta.sources;
+              }
+            } catch {}
+            text = text.slice(end + 8);
+            metaParsed = true;
           }
+        } else if (metaParsed === false) {
           metaParsed = true;
         }
 
@@ -411,7 +415,6 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
         });
       }
 
-      // Auto-speak if enabled
       if (speakReplies && accumulated.trim()) {
         const messageId = messages.length + 1;
         setTimeout(() => speakMessage(accumulated, messageId), 200);
@@ -430,10 +433,7 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         setMessages((prev) => {
           const next = [...prev];
-          next[next.length - 1] = {
-            role: "assistant",
-            content: `Error: ${msg}`,
-          };
+          next[next.length - 1] = { role: "assistant", content: `Error: ${msg}` };
           return next;
         });
       }
@@ -499,37 +499,19 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               transition={{ delay: 0.2 }}
-              className="text-gray-400 mb-6 max-w-lg mx-auto"
+              className="text-gray-400 mb-8 max-w-lg mx-auto"
             >
-              Ask by text or voice. Upload photos of notes or PDFs. I can answer
-              anything — and use your {pdfCount > 0 ? (
+              Ask anything by text or voice. Upload images or PDFs. I can answer
+              general questions and use your{" "}
+              {pdfCount > 0 ? (
                 <span className="text-purple-300 font-semibold">
                   {pdfCount} {pdfCount === 1 ? "PDF" : "PDFs"}
                 </span>
-              ) : "PDFs"} when relevant.
+              ) : (
+                "PDFs"
+              )}{" "}
+              when relevant.
             </motion.p>
-
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ delay: 0.3 }}
-              className="flex items-center justify-center gap-3 mb-8 text-xs text-gray-500 flex-wrap"
-            >
-              <span className="flex items-center gap-1.5">
-                <Mic className="w-3 h-3 text-purple-300" />
-                Voice input
-              </span>
-              <span>·</span>
-              <span className="flex items-center gap-1.5">
-                <Volume2 className="w-3 h-3 text-cyan-300" />
-                Voice replies
-              </span>
-              <span>·</span>
-              <span className="flex items-center gap-1.5">
-                <Paperclip className="w-3 h-3 text-pink-300" />
-                Images & PDFs
-              </span>
-            </motion.div>
 
             <motion.div
               initial={{ opacity: 0, y: 20 }}
@@ -579,15 +561,10 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
                   )}
 
                   <div className={`max-w-[85%] min-w-0 ${m.role === "user" ? "order-first" : ""}`}>
-                    {/* Attachment preview (user) */}
                     {m.attachment && m.previewUrl && (
                       <div className="mb-2 rounded-xl overflow-hidden border border-white/20 max-w-xs ml-auto">
                         {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img
-                          src={m.previewUrl}
-                          alt="attachment"
-                          className="max-h-48 w-auto"
-                        />
+                        <img src={m.previewUrl} alt="attachment" className="max-h-48 w-auto" />
                       </div>
                     )}
 
@@ -751,7 +728,6 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
             </div>
           )}
 
-          {/* Pending attachment preview */}
           <AnimatePresence>
             {pendingFile && (
               <motion.div
@@ -791,7 +767,6 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
           </AnimatePresence>
 
           <form onSubmit={handleSubmit} className="flex gap-2 items-end">
-            {/* Attachment button */}
             <input
               ref={fileInputRef}
               type="file"
@@ -813,7 +788,6 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
               <Paperclip className="w-5 h-5" />
             </button>
 
-            {/* Language picker */}
             <div className="relative flex-shrink-0" data-lang-menu>
               <button
                 type="button"
@@ -908,7 +882,7 @@ export default function TutorClient({ pdfCount }: { pdfCount: number }) {
           </form>
 
           <p className="text-[10px] text-gray-500 text-center mt-2">
-            📎 Attach images or PDFs · 🎤 Voice input · 🔊 Voice replies
+            📎 Attach files · 🎤 Voice input · 🔊 Voice replies · Auto language
           </p>
         </div>
       </div>

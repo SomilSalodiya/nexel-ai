@@ -73,6 +73,7 @@ export async function POST(req: NextRequest) {
 
     console.log(`🎓 Tutor query: "${question.slice(0, 60)}"`);
 
+    // 1. Try to find relevant PDF context
     let sources: { file_name: string; snippet: string; similarity: number }[] = [];
     let context = "";
 
@@ -127,6 +128,7 @@ export async function POST(req: NextRequest) {
       console.log("  ⚠️ Skipping PDF context (embedding failed)");
     }
 
+    // 2. Load conversation history
     let history: { role: string; content: string }[] = [];
     if (conversationId) {
       const { data: prevMsgs } = await supabase
@@ -134,44 +136,42 @@ export async function POST(req: NextRequest) {
         .select("role, content")
         .eq("conversation_id", conversationId)
         .order("created_at", { ascending: true })
-        .limit(6);
+        .limit(8);
 
       if (prevMsgs) {
         history = prevMsgs.map((m) => ({ role: m.role, content: m.content }));
       }
     }
 
+    // 3. Build system prompt
     const hasContext = context.length > 0;
 
-    const systemPrompt = `You are Nexel AI — a smart, friendly AI assistant and study companion.
+    const systemPrompt = `You are Nexel AI — a smart, friendly AI assistant and study companion. You're as capable as ChatGPT.
 
 ${hasContext
-  ? `You have access to excerpts from the user's uploaded PDFs (see "Sources" below). You may use them when relevant.`
-  : `The user does NOT have relevant PDF content for this question, OR their PDFs don't cover it. Answer from your general knowledge.`}
+  ? `You have access to excerpts from the user's uploaded PDFs (see "Sources" below). Use them when relevant.`
+  : `The user's PDFs don't cover this question, so answer from your general knowledge.`}
 
 BEHAVIOR:
 - If the question relates to the PDFs → use the sources, cite "According to [PDF name]..."
-- If the question is general knowledge → answer directly from your training
-- If both apply → combine PDF insights with your broader knowledge
-- NEVER say "not in your documents" or "not in my context"
-- NEVER refuse to answer — you're a full AI assistant
+- If general knowledge → answer directly from your training
+- NEVER say "not in your documents" or refuse to answer
 - If you genuinely don't know → say so honestly
-- Be warm, patient, and conversational — like a helpful tutor
+- Be warm, clear, and thorough — like a great tutor
 
 FORMAT:
-- Use markdown when helpful (bold, bullets, code blocks)
-- Keep answers focused (150-400 words for most questions)
+- Use markdown (bold, bullets, headers when useful, \`\`\`code blocks\`\`\`)
+- Keep answers 150-500 words for most questions
+- For code → provide runnable examples with \`\`\`language
 
-LANGUAGE HANDLING (IMPORTANT):
-- If the question is in English → respond in English
-- If the question is in Hindi (Devanagari) → respond in Hindi
-- If the question is in Hinglish → respond in Hinglish
-- Mirror the user's language`;
+LANGUAGE:
+- Match the user's language exactly (English → English, Hindi → Hindi, Hinglish → Hinglish)`;
 
     const userMessage = hasContext
       ? `Sources from my PDFs:\n\n${context}\n\n---\n\nMy question: ${question}`
       : question;
 
+    // 4. Stream from Groq
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
     const stream = await groq.chat.completions.create({
@@ -189,11 +189,17 @@ LANGUAGE HANDLING (IMPORTANT):
       stream: true,
     });
 
+    // 5. Stream response + save
+    // Sources are sent as a __META__ prefix (avoids Unicode header issues)
     const encoder = new TextEncoder();
     let fullAnswer = "";
 
     const readable = new ReadableStream({
       async start(controller) {
+        // Send sources as meta prefix FIRST
+        const meta = JSON.stringify({ sources });
+        controller.enqueue(encoder.encode(`__META__${meta}__META__`));
+
         try {
           for await (const chunk of stream) {
             const text = chunk.choices[0]?.delta?.content || "";
@@ -244,7 +250,6 @@ LANGUAGE HANDLING (IMPORTANT):
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "no-cache",
-        "X-Sources": JSON.stringify(sources),
       },
     });
   } catch (err: unknown) {

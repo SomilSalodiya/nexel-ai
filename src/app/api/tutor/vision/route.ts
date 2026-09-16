@@ -130,11 +130,9 @@ export async function POST(req: NextRequest) {
     }
 
     console.log(`📎 Attachment: ${file.name} (${mimeType}, ${Math.round(file.size / 1024)}KB)`);
-    console.log(`   Question: "${question.slice(0, 60)}"`);
 
     const fileName = `${Date.now()}-${file.name.replace(/[^a-zA-Z0-9.-]/g, "_")}`;
     const storagePath = `${user.id}/${fileName}`;
-
     const fileBuffer = Buffer.from(await file.arrayBuffer());
 
     const { error: uploadError } = await supabase.storage
@@ -167,6 +165,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Save to database
     try {
       let convId = conversationId ? parseInt(conversationId) : null;
 
@@ -219,6 +218,7 @@ export async function POST(req: NextRequest) {
       console.log("Save error:", err);
     }
 
+    // Stream response with __META__ prefix (avoid Unicode in headers)
     const encoder = new TextEncoder();
     const readable = new ReadableStream({
       start(controller) {
