@@ -73,7 +73,6 @@ export async function POST(req: NextRequest) {
 
     console.log(`🎓 Tutor query: "${question.slice(0, 60)}"`);
 
-    // 1. Try to find relevant PDF context (best-effort)
     let sources: { file_name: string; snippet: string; similarity: number }[] = [];
     let context = "";
 
@@ -128,7 +127,6 @@ export async function POST(req: NextRequest) {
       console.log("  ⚠️ Skipping PDF context (embedding failed)");
     }
 
-    // 2. Load conversation history
     let history: { role: string; content: string }[] = [];
     if (conversationId) {
       const { data: prevMsgs } = await supabase
@@ -143,7 +141,6 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 3. Build system prompt
     const hasContext = context.length > 0;
 
     const systemPrompt = `You are Nexel AI — a smart, friendly AI assistant and study companion.
@@ -164,7 +161,6 @@ BEHAVIOR:
 FORMAT:
 - Use markdown when helpful (bold, bullets, code blocks)
 - Keep answers focused (150-400 words for most questions)
-- For code → use \`\`\`language ... \`\`\` blocks
 
 LANGUAGE HANDLING (IMPORTANT):
 - If the question is in English → respond in English
@@ -176,7 +172,6 @@ LANGUAGE HANDLING (IMPORTANT):
       ? `Sources from my PDFs:\n\n${context}\n\n---\n\nMy question: ${question}`
       : question;
 
-    // 4. Stream from Groq
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
     const stream = await groq.chat.completions.create({
@@ -194,7 +189,6 @@ LANGUAGE HANDLING (IMPORTANT):
       stream: true,
     });
 
-    // 5. Stream response + save
     const encoder = new TextEncoder();
     let fullAnswer = "";
 

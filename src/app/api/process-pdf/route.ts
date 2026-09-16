@@ -11,7 +11,7 @@ export const maxDuration = 300;
 const CHUNK_SIZE = 1000;
 const CHUNK_OVERLAP = 200;
 const JINA_API = "https://api.jina.ai/v1/embeddings";
-const JINA_MODEL = "jina-embeddings-v2-small-en"; // 512 dims
+const JINA_MODEL = "jina-embeddings-v2-base-en";
 
 function chunkText(text: string): string[] {
   const chunks: string[] = [];
@@ -25,7 +25,6 @@ function chunkText(text: string): string[] {
   return chunks;
 }
 
-// Batch embeddings — Jina accepts multiple inputs at once
 async function getEmbeddingsBatch(texts: string[]): Promise<number[][]> {
   const apiKey = process.env.JINA_API_KEY;
   if (!apiKey) throw new Error("JINA_API_KEY not configured");
@@ -69,7 +68,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Missing filePath or fileName" }, { status: 400 });
     }
 
-    // Check if already processed
     const { count } = await supabase
       .from("pdf_chunks")
       .select("*", { count: "exact", head: true })
@@ -80,7 +78,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: true, chunks: count, cached: true });
     }
 
-    // Download PDF
     const { data: fileData, error: downloadError } = await supabase.storage
       .from("pdfs")
       .download(filePath);
@@ -110,7 +107,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "No chunks created" }, { status: 400 });
     }
 
-    // Process in batches of 32 (Jina supports up to 2048 inputs, but batches keep requests small)
     console.log("🤖 Getting embeddings via Jina AI...");
     const BATCH_SIZE = 32;
     const records: Record<string, unknown>[] = [];
