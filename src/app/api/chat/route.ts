@@ -9,7 +9,7 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 const JINA_API = "https://api.jina.ai/v1/embeddings";
-const JINA_MODEL = "jina-embeddings-v2-small-en";
+const JINA_MODEL = "jina-embeddings-v2-base-en";
 
 async function getQueryEmbedding(text: string): Promise<number[]> {
   const apiKey = process.env.JINA_API_KEY;
