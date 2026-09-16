@@ -10,7 +10,7 @@ import { createClient } from "@/lib/supabase/client";
 type Pdf = {
   name: string;
   id: string | null;
-  created_at: string;
+  created_at: string | null;
   metadata: { size?: number } | null;
 };
 export default function PdfList({
